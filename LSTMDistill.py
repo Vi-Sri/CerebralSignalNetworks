@@ -48,7 +48,7 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
 
     # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
 
-    mse_loss = F.smooth_l1_loss(student_logits, teacher_logits)
+    mse_loss = F.mse_loss(student_logits, teacher_logits)
                         
     # Weighted sum of the two losses
     loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
@@ -132,7 +132,7 @@ if __name__=="__main__":
                         help='Subject Data to train')
     parser.add_argument('--eeg_dataset',
                         type=str,
-                        default="./data/eeg/eeg_signals_raw_with_mean_std.pth",
+                        default="./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth",
                         help='Dataset to train')
     parser.add_argument('--images_root',
                         type=str,
@@ -180,7 +180,18 @@ if __name__=="__main__":
                         type=str,
                         default="{'ce_loss_weight': 0.50, 'soft_target_loss_weight':0.50,'alpha': 1,'temperature':2}",
                         help='hyper params for training model, pass dict tpye in string format')
+    parser.add_argument('--seed', default=43, type=int, help='Random seed.')
+    parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
+        distributed training; see https://pytorch.org/docs/stable/distributed.html""")
+    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
 
+
+    FLAGS = None
+    FLAGS, unparsed = parser.parse_known_args()
+    print(FLAGS)
+
+    os.makedirs(FLAGS.log_dir, exist_ok=True)
 
     SUBJECT = FLAGS.gallery_subject
     BATCH_SIZE = FLAGS.batch_size
@@ -303,7 +314,7 @@ if __name__=="__main__":
                 else:
                     if loss.item()<best_val_loss:
                         best_val_loss = loss.item()
-                        torch.save(model.state_dict(), f"lstm_dinov2_best_loss.pth")
+                        torch.save(model.state_dict(), f"{FLAGS.log_dir}/lstm_dinov2_best_loss.pth")
         
         batch_losses = np.array(batch_losses)
         val_batch_losses = np.array(val_batch_losses)
