@@ -148,12 +148,14 @@ class EEGDataset(Dataset):
         return ImagePath
     
     @torch.no_grad()
-    def extract_features(self,model, data_loader, use_cuda=True, multiscale=False, replace_eeg=True):
+    def extract_features(self,model, data_loader, use_cuda=True, multiscale=False, replace_eeg=True, passEEG=False):
         metric_logger = utils.MetricLogger(delimiter="  ")
         features = None
         # for samples, index in metric_logger.log_every(data_loader, 10):
         for EEG,labels,image, index, Image_features in metric_logger.log_every(data_loader, 10):
             samples = image
+            # if passEEG:
+            #     samples = EEG
             samples = samples.cuda(non_blocking=True)
             index = index.cuda(non_blocking=True)
             if multiscale:
@@ -283,6 +285,21 @@ class EEGDataset(Dataset):
     
 
     
+    def transformEEGDataLSTM(self, lstm_model,device, replaceEEG=True):
+        lstm_model.to(device)
+        lstm_model.eval()
+        self.image_features = [i for i in range(len(self))]
+        for i in range(len(self)):
+            eeg, label,image,i, image_features = self[i]
+
+            with torch.no_grad():
+                lstm_output = lstm_model(eeg.unsqueeze(0).to(device))
+                if replaceEEG:
+                    self.subsetData[i]["eeg"] = lstm_output
+                else:
+                    self.image_features[i] = lstm_output
+
+
     def transformEEGData(self, resnet_model, resnet_to_eeg_model, device, isVIT=False):
         print("Transforming EEG data")
         resnet_to_eeg_model = resnet_to_eeg_model.to(device)

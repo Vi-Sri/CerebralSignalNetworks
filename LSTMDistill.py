@@ -48,7 +48,7 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
 
     # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
 
-    mse_loss = F.smooth_l1_loss(student_logits, teacher_logits)
+    mse_loss = F.mse_loss(student_logits, teacher_logits)
                         
     # Weighted sum of the two losses
     loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
@@ -191,6 +191,8 @@ if __name__=="__main__":
     FLAGS, unparsed = parser.parse_known_args()
     print(FLAGS)
 
+    os.makedirs(FLAGS.log_dir, exist_ok=True)
+
     SUBJECT = FLAGS.gallery_subject
     BATCH_SIZE = FLAGS.batch_size
     learning_rate = FLAGS.learning_rate
@@ -312,7 +314,7 @@ if __name__=="__main__":
                 else:
                     if loss.item()<best_val_loss:
                         best_val_loss = loss.item()
-                        torch.save(model.state_dict(), f"lstm_dinov2_best_loss.pth")
+                        torch.save(model.state_dict(), f"{FLAGS.log_dir}/lstm_dinov2_best_loss.pth")
         
         batch_losses = np.array(batch_losses)
         val_batch_losses = np.array(val_batch_losses)
