@@ -132,7 +132,7 @@ if __name__=="__main__":
                         help='Subject Data to train')
     parser.add_argument('--eeg_dataset',
                         type=str,
-                        default="./data/eeg/eeg_signals_raw_with_mean_std.pth",
+                        default="./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth",
                         help='Dataset to train')
     parser.add_argument('--images_root',
                         type=str,
@@ -180,7 +180,16 @@ if __name__=="__main__":
                         type=str,
                         default="{'ce_loss_weight': 0.50, 'soft_target_loss_weight':0.50,'alpha': 1,'temperature':2}",
                         help='hyper params for training model, pass dict tpye in string format')
+    parser.add_argument('--seed', default=43, type=int, help='Random seed.')
+    parser.add_argument('--num_workers', default=4, type=int, help='Number of data loading workers per GPU.')
+    parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
+        distributed training; see https://pytorch.org/docs/stable/distributed.html""")
+    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
 
+
+    FLAGS = None
+    FLAGS, unparsed = parser.parse_known_args()
+    print(FLAGS)
 
     SUBJECT = FLAGS.gallery_subject
     BATCH_SIZE = FLAGS.batch_size
