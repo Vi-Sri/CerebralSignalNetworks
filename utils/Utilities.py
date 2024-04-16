@@ -259,7 +259,9 @@ class Utilities:
 
     def plotSampleEEGChannels(self, eeg_data, channels_to_plot, saveFigure=False, saveFigurename=None):
 
-        plt.clf()
+        if not saveFigure:
+            plt.clf()
+
         plt.figure().set_size_inches(20,5)
         # for x in range(normalized_data.shape[-1]):
 
@@ -273,7 +275,9 @@ class Utilities:
         plt.grid(True)
         if saveFigure:
             plt.savefig(saveFigurename)
-        plt.show()
+        if not saveFigure:
+            plt.show()
+        plt.close()
 
 
 
