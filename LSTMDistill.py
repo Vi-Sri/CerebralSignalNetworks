@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from utils import utils
 
 
-class Paramters:
+class Parameters:
     ce_loss_weight = 0.50
     soft_target_loss_weight = 0.50
     alpha = 1
@@ -51,11 +51,11 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
     mse_loss = F.smooth_l1_loss(student_logits, teacher_logits)
                         
     # Weighted sum of the two losses
-    # loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
+    loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
 
     # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), F.softmax(teacher_outputs/T, dim=1))
 
-    return mse_loss
+    return loss
 
 
 
@@ -104,18 +104,105 @@ class LSTMModel(nn.Module):
 
 if __name__=="__main__":
 
-    SUBJECT = 1
-    BATCH_SIZE = 8
-    learning_rate = 0.001
-    EPOCHS = 50
+
+    parser = argparse.ArgumentParser('CNN Exercise.')
+    parser.add_argument('--learning_rate',
+                        type=float, default=0.0001,
+                        help='Initial learning rate.')
+    parser.add_argument('--num_epochs',
+                        type=int,
+                        default=100,
+                        help='Number of epochs to run trainer.')
+    parser.add_argument('--batch_size',
+                        type=int, default=16,
+                        help='Batch size. Must divide evenly into the dataset sizes.')
+    parser.add_argument('--log_dir',
+                        type=str,
+                        default='./logs/DINOvsDinIE/',
+                        help='Directory to put logging.')
+    parser.add_argument('--gallery_subject',
+                        type=int,
+                        default=1,
+                        choices=[0,1,2,3,4,5,6],
+                        help='Subject Data to train')
+    parser.add_argument('--query_subject',
+                        type=int,
+                        default=1,
+                        choices=[0,1,2,3,4,5,6],
+                        help='Subject Data to train')
+    parser.add_argument('--eeg_dataset',
+                        type=str,
+                        default="./data/eeg/eeg_signals_raw_with_mean_std.pth",
+                        help='Dataset to train')
+    parser.add_argument('--images_root',
+                        type=str,
+                        default="./data/images/",
+                        help='Dataset to train')
+    parser.add_argument('--eeg_dataset_split',
+                        type=str,
+                        default="./data/eeg/block_splits_by_image_all.pth",
+                        help='Dataset split')
+    parser.add_argument('--mode',
+                        type=str,
+                        default="train",
+                        help='type of mode train or test')
+    parser.add_argument('--custom_model_weights',
+                        type=str,
+                        default="./models/dino/localcrops_as_eeg/subject1/checkpoint.pth",
+                        help='custom model weights')
+    parser.add_argument('--dino_base_model_weights',
+                        type=str,
+                        default="./models/pretrains/dino_deitsmall8_pretrain_full_checkpoint.pth",
+                        help='dino based model weights')
+    parser.add_argument('--search_gallery',
+                        type=str,
+                        default="train",
+                        help='dataset in which images will be searched')
+    parser.add_argument('--query_gallery',
+                        type=str,
+                        default="test",
+                        help='dataset in which images will be searched')
+    parser.add_argument('--topK',
+                        type=int,
+                        default=5,
+                        help='Top-k paramter, defaults to 5')
+    parser.add_argument('--gallery_tranformation_type',
+                        type=str,
+                        default="eeg2eeg",
+                        choices=["img", "img2eeg", "eeg", "eeg2eeg"],
+                        help='type of tansformation needed to be done to create search gallery')
+    parser.add_argument('--query_tranformation_type',
+                        type=str,
+                        default="eeg2eeg",
+                        choices=["img", "img2eeg", "eeg", "eeg2eeg"],
+                        help='type of tansformation needed to be done to create query instances')
+    parser.add_argument('--hyperprams',
+                        type=str,
+                        default="{'ce_loss_weight': 0.50, 'soft_target_loss_weight':0.50,'alpha': 1,'temperature':2}",
+                        help='hyper params for training model, pass dict tpye in string format')
+
+
+    SUBJECT = FLAGS.gallery_subject
+    BATCH_SIZE = FLAGS.batch_size
+    learning_rate = FLAGS.learning_rate
+    EPOCHS = FLAGS.num_epochs
     SaveModelOnEveryEPOCH = 100
-    EEG_DATASET_PATH = "./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth"
+    EEG_DATASET_PATH = FLAGS.eeg_dataset
     # EEG_DATASET_SPLIT = "./data/eeg/block_splits_by_image_all.pth"
 
     LSTM_INPUT_FEATURES = 128 # should be image features output.
     LSTM_HIDDEN_SIZE = 460  # should be same as sequence length
     selectedDataset = "imagenet40"
 
+    hyperprams = eval(FLAGS.hyperprams)
+    if 'alpha' in hyperprams:
+        Parameters.alpha = hyperprams["alpha"]
+    if 'ce_loss_weight' in hyperprams:
+        Parameters.ce_loss_weight = hyperprams["ce_loss_weight"]
+    if 'soft_target_loss_weight' in hyperprams:
+        Parameters.soft_target_loss_weight = hyperprams["soft_target_loss_weight"]
+    if 'temperature' in hyperprams:
+        Parameters.temperature = hyperprams["temperature"]
 
     utils.init_distributed_mode(FLAGS)
 
@@ -131,7 +218,7 @@ if __name__=="__main__":
                          eeg_splits_path=None, 
                          subject=SUBJECT,
                          time_low=0,
-                         imagesRoot="./data/images/imageNet_images",
+                         imagesRoot=FLAGS.images_root,
                          time_high=480,
                          exclude_subjects=[],
                          convert_image_to_tensor=False,
@@ -157,14 +244,10 @@ if __name__=="__main__":
     dataset.extract_features(model=dinov2_model, data_loader=data_loader_train, replace_eeg=False)
 
     generator1 = torch.Generator().manual_seed(43)
-    # HAR_train_ds, HAR_val_ds, HAR_test_ds = torch.utils.data.random_split(HAR_data, [0.7, 0.2, 0.1], generator=generator1)
-    
     train_ds, val_ds = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=generator1)
     data_loader_train = DataLoader(train_ds, batch_size=FLAGS.batch_size, shuffle=True)
     data_loader_val = DataLoader(val_ds, batch_size=FLAGS.batch_size, shuffle=True)
 
-    # train_ds.dataset.extract_features(model=dinov2_model, data_loader=data_loader_train, replace_eeg=False)
-    # val_ds.dataset.extract_features(model=dinov2_model, data_loader=data_loader_val, replace_eeg=False)
 
     eeg, label,image,i, image_features = next(iter(data_loader_train)) 
     outs = dinov2_model(image.to(device))
@@ -173,18 +256,16 @@ if __name__=="__main__":
 
     model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=features_length, n_layers=4)
     model.to(device)
-    # model
 
     output = model(eeg.to(device))
     print(output.size())    
 
 
-    # criterion = CustomLoss()
     opt = torch.optim.Adam(lr=learning_rate, params=model.parameters())
-    # criterion = 
 
     epoch_losses = []
     val_epoch_losses = []
+    best_val_loss = None
     for EPOCH in range(EPOCHS):
 
         batch_losses = []
@@ -196,14 +277,11 @@ if __name__=="__main__":
             eeg, label,image,i, image_features = data
 
             image_features = torch.from_numpy(np.array(image_features)).to(device)
-            # print(image_features.size())
 
             opt.zero_grad()
             lstm_output = model(eeg.to(device))
-            # dinov2_out = dinov2_model(image.to(device))
 
-            # loss = criterion(image_features, lstm_output)
-            loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Paramters)
+            loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Parameters)
             batch_losses.append(loss.item())
 
             loss.backward()
@@ -217,9 +295,15 @@ if __name__=="__main__":
             with torch.no_grad():
                 image_features = torch.from_numpy(np.array(image_features)).to(device)
                 lstm_output = model(eeg.to(device))
-                # loss = criterion(image_features, lstm_output)
-                loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Paramters)
+                loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Parameters)
                 val_batch_losses.append(loss.item())
+
+                if best_val_loss is None:
+                    best_val_loss = loss.item()
+                else:
+                    if loss.item()<best_val_loss:
+                        best_val_loss = loss.item()
+                        torch.save(model.state_dict(), f"lstm_dinov2_best_loss.pth")
         
         batch_losses = np.array(batch_losses)
         val_batch_losses = np.array(val_batch_losses)
@@ -231,7 +315,7 @@ if __name__=="__main__":
         print(f"EPOCH {EPOCH} train_loss: {round(epoch_loss,6)} val_loss: {round(val_epoch_loss,6)}")
 
     
-    torch.save(model.state_dict(), f"lstm_dinov2_learned_fewatures_{EPOCHS}.pth")
+    # torch.save(model.state_dict(), f"lstm_dinov2_learned_fewatures_{EPOCHS}_fina.pth")
 
 
 
