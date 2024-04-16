@@ -48,14 +48,14 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
 
     # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
 
-    mse_loss = F.mse_loss(student_logits, teacher_logits)
+    mse_loss = F.smooth_l1_loss(student_logits, teacher_logits)
                         
     # Weighted sum of the two losses
-    loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
+    # loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
 
     # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), F.softmax(teacher_outputs/T, dim=1))
 
-    return loss
+    return mse_loss
 
 
 
@@ -106,7 +106,7 @@ if __name__=="__main__":
 
     SUBJECT = 1
     BATCH_SIZE = 8
-    learning_rate = 0.005
+    learning_rate = 0.001
     EPOCHS = 50
     SaveModelOnEveryEPOCH = 100
     EEG_DATASET_PATH = "./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth"
@@ -156,7 +156,7 @@ if __name__=="__main__":
     data_loader_train = DataLoader(dataset, batch_size=FLAGS.batch_size, shuffle=True)
     dataset.extract_features(model=dinov2_model, data_loader=data_loader_train, replace_eeg=False)
 
-    generator1 = torch.Generator().manual_seed(123)
+    generator1 = torch.Generator().manual_seed(43)
     # HAR_train_ds, HAR_val_ds, HAR_test_ds = torch.utils.data.random_split(HAR_data, [0.7, 0.2, 0.1], generator=generator1)
     
     train_ds, val_ds = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=generator1)
@@ -171,7 +171,7 @@ if __name__=="__main__":
     features_length = outs.size(-1)
     print(outs.size())
 
-    model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=features_length)
+    model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=features_length, n_layers=4)
     model.to(device)
     # model
 
@@ -228,7 +228,7 @@ if __name__=="__main__":
         epoch_losses.append(epoch_loss)
         val_epoch_losses.append(val_epoch_loss)
 
-        print(f"EPOCH {EPOCH} train_loss: {epoch_loss} val_loss: {val_epoch_loss}")
+        print(f"EPOCH {EPOCH} train_loss: {round(epoch_loss,6)} val_loss: {round(val_epoch_loss,6)}")
 
     
     torch.save(model.state_dict(), f"lstm_dinov2_learned_fewatures_{EPOCHS}.pth")
