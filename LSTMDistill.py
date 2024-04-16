@@ -19,8 +19,8 @@ from utils import utils
 
 
 class Paramters:
-    ce_loss_weight = 0.25
-    soft_target_loss_weight = 0.75
+    ce_loss_weight = 0.50
+    soft_target_loss_weight = 0.50
     alpha = 1
     temperature = 2
 
@@ -80,13 +80,17 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_size, out_features)
     
     def forward(self, x):
-        batch_size = x.size(0)
+        batch_size, timespan, channels = x.size()
+        x = x.view(batch_size, channels, timespan)
         lstm_init = (torch.zeros(self.n_layer, batch_size, self.hidden_size), torch.zeros(self.n_layer, batch_size, self.hidden_size))
         if x.is_cuda: lstm_init = (lstm_init[0].cuda(), lstm_init[0].cuda())
         lstm_init = (Variable(lstm_init[0], volatile=x.volatile), Variable(lstm_init[1], volatile=x.volatile))
 
         # Forward LSTM and get final state
         x = self.lstm(x, lstm_init)[0][:,-1,:]
+
+        # hx0, hx1 =  self.lstm(x, lstm_init)[1]
+        # print(hx0.size(), hx1.size())
         # x = F.softmax(self.fc(x))
         x = self.fc(x)
 
@@ -102,10 +106,10 @@ if __name__=="__main__":
 
     SUBJECT = 1
     BATCH_SIZE = 8
-    learning_rate = 0.0001
+    learning_rate = 0.005
     EPOCHS = 50
     SaveModelOnEveryEPOCH = 100
-    EEG_DATASET_PATH = "./data/eeg/theperils/spampinato-1-3RAW_with_mean_std.pth"
+    EEG_DATASET_PATH = "./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth"
     # EEG_DATASET_SPLIT = "./data/eeg/block_splits_by_image_all.pth"
 
     LSTM_INPUT_FEATURES = 128 # should be image features output.
@@ -131,7 +135,7 @@ if __name__=="__main__":
                          time_high=480,
                          exclude_subjects=[],
                          convert_image_to_tensor=False,
-                         apply_channel_wise_norm=True,
+                         apply_channel_wise_norm=False,
                          preprocessin_fn=transform_image)
 
 
@@ -167,7 +171,7 @@ if __name__=="__main__":
     features_length = outs.size(-1)
     print(outs.size())
 
-    model = LSTMModel(input_size=LSTM_INPUT_FEATURES,hidden_size=LSTM_HIDDEN_SIZE, out_features=features_length)
+    model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=features_length)
     model.to(device)
     # model
 
@@ -176,12 +180,12 @@ if __name__=="__main__":
 
 
     # criterion = CustomLoss()
-    opt = torch.optim.Adam(lr=0.001, params=model.parameters())
+    opt = torch.optim.Adam(lr=learning_rate, params=model.parameters())
     # criterion = 
 
     epoch_losses = []
     val_epoch_losses = []
-    for EPOCH in range(50):
+    for EPOCH in range(EPOCHS):
 
         batch_losses = []
         val_batch_losses = []
@@ -225,6 +229,9 @@ if __name__=="__main__":
         val_epoch_losses.append(val_epoch_loss)
 
         print(f"EPOCH {EPOCH} train_loss: {epoch_loss} val_loss: {val_epoch_loss}")
+
+    
+    torch.save(model.state_dict(), f"lstm_dinov2_learned_fewatures_{EPOCHS}.pth")
 
 
 
