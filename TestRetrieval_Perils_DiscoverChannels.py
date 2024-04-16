@@ -18,7 +18,7 @@ import mne
 from mne.preprocessing import ICA
 Utilities_handler = Utilities()
 
-
+from torch.utils.data import DataLoader
 import json
 class NpEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -33,28 +33,36 @@ class NpEncoder(json.JSONEncoder):
 
 import time
 
+SUBJECT = 1
+BATCH_SIZE = 8
+learning_rate = 0.0001
+EPOCHS = 50
+SaveModelOnEveryEPOCH = 100
+EEG_DATASET_PATH = "./data/eeg/theperils/spampinato-1-3RAW_with_mean_std.pth"
+# EEG_DATASET_SPLIT = "./data/eeg/block_splits_by_image_all.pth"
 
-channelMap = Utilities_handler.read_channel_map(input_file="./channelmap.txt")
+LSTM_INPUT_FEATURES = 128 # should be image features output.
+LSTM_HIDDEN_SIZE = 460  # should be same as sequence length
+selectedDataset = "imagenet40"
 
 # eeg_signals_path="./data/eeg/eeg_signals_raw_with_mean_std.pth", 
 # dataset = EEGDataset(subset="train",eeg_signals_path="./data/eeg/eeg_14_70_std.pth", eeg_splits_path="./data/eeg/block_splits_by_image_all.pth", subject=1,preprocessin_fn=None, time_low=20, time_high=480)
 dataset = EEGDataset(subset="train",
-                     eeg_signals_path="./data/eeg/eeg_signals_raw_with_mean_std.pth", 
-                     eeg_splits_path="./data/eeg/block_splits_by_image_all.pth", 
-                     subject=1,
-                     preprocessin_fn=None, 
-                     time_low=0, 
-                     apply_norm_with_stds_and_means=True,
-                     time_high=490)
+                         eeg_signals_path=EEG_DATASET_PATH,
+                         eeg_splits_path=None, 
+                         subject=SUBJECT,
+                         time_low=0,
+                         imagesRoot="./data/images/imageNet_images",
+                         time_high=480,
+                         exclude_subjects=[],
+                         convert_image_to_tensor=True,
+                         apply_channel_wise_norm=True,
+                         preprocessin_fn=None)
 
-test_dataset = EEGDataset(subset="test",
-                     eeg_signals_path="./data/eeg/eeg_signals_raw_with_mean_std.pth", 
-                     eeg_splits_path="./data/eeg/block_splits_by_image_all.pth", 
-                     subject=1,
-                     preprocessin_fn=None, 
-                     time_low=0, 
-                     apply_norm_with_stds_and_means=True,
-                     time_high=490)
+generator1 = torch.Generator().manual_seed(123)
+train_ds, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=generator1)
+data_loader_train = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+data_loader_val = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 def addFeatures(label_wise_data, 
                 label_index_To_Add, 
@@ -94,7 +102,9 @@ def addFeatures(label_wise_data,
             # print(f"Error : {e}")
     return features, labels, str_labels
 
+
 label_wise_data = {}
+label_wise_test_data = {}
 for data in dataset:
     eeg, label,image,i, image_features = data
     if not label["ClassId"] in label_wise_data:
@@ -103,7 +113,6 @@ for data in dataset:
     label_wise_data[label["ClassId"]]["eeg"].append(eeg.numpy())
     label_wise_data[label["ClassId"]]["strClass"].append(label["ClassName"])
 
-label_wise_test_data = {}
 for data in test_dataset:
     eeg, label,image,i, image_features = data
     if not label["ClassId"] in label_wise_test_data:
@@ -113,94 +122,13 @@ for data in test_dataset:
     label_wise_test_data[label["ClassId"]]["strClass"].append(label["ClassName"])
 
 
-# SelectedChannels = [51,52,56,71]
-# SelectedChannels = [51,52]
-# SelectedChannels = [55]
-# SelectedChannels = [71]
-# SelectedChannels = [51,52,55,56,60,71,75,79, 106]
-# SelectedChannels = [118]
-# SelectedChannels = [117]
-# SelectedChannels = [51,52,55,56,60,71,75,79,106]
-# SelectedChannels = [2,6,7,10,22,26,28,30,34,33] # from [Reading into the mind’s eye: Boosting automatic visual recognition with EEG signals]
-# SelectedChannels = [2,6,7,10,22,26,28,30,34,33,51,52,55,56,60,71,75,79,106]
-SelectedChannels__ = [2,6,7,10,22,26,28,30,34,33,51,52,55,56,60,71,75,79,106]
-
+SelectedChannels__ = []
 TimeStart = 20
-TimeEnd = 160
-
-# plt.clf()
-ClassesToAdd = [0,13,23,29]
-
+TimeEnd = 480
 ChannelWiseMetrics = {}
-
-
-
-# MasterFixedChannels = [33,46,49,71,35,91,48,31,105,51,52,39,105] # manually added channel 71,51,52
-# MasterFixedChannels = [71, 39, 35, 79] # manually added channel 
-MasterFixedChannels = [28,30,91,107,1,5,99,3,94,78,4,119,47,108] # manually added channel
-# MasterFixedChannels = [33] # AF3  #best ts 167_168  with Scores: {'Recall': 18.809, 'Precision': 3.9004999999999996}
-# MasterFixedChannels = [34] # AF4 #best ts 346_347  with Scores: {'Recall': 17.884, 'Precision': 3.6717499999999994}
-# MasterFixedChannels = [46]  #best ts 429_430  with Scores: {'Recall': 17.67625, 'Precision': 3.535}
-# MasterFixedChannels = [71] #FTT9h #best ts 125_126  with Scores: {'Recall': 17.8555, 'Precision': 3.69625}
-# MasterFixedChannels = [28,30] #O1, O2 #best ts 231_232  with Scores: {'Recall': 19.18775, 'Precision': 3.8870000000000005}
-# MasterFixedChannels = [7,10] FC5,FC6 #best ts  63_64  with Scores: {'Recall': 18.389, 'Precision': 3.72275}
-# MasterFixedChannels = [2,6] # F7,F8 #best ts 177_178  with Scores: {'Recall': 19.16225, 'Precision': 3.93225}
-# MasterFixedChannels = [2]  # F7 # best ts 261_262  with Scores: {'Recall': 18.137, 'Precision': 3.8950000000000005}
-# MasterFixedChannels = [6]  # F8 #best ts  192_193  with Scores: {'Recall': 16.830750000000002, 'Precision': 3.5072500000000004}
-# MasterFixedChannels = [33,34] # AF3, AF4  #best ts 49_50  with Scores: {'Recall': 16.360500000000002, 'Precision': 3.401}
-# MasterFixedChannels = [22,26] # P7, P8  #best ts 27_28  with Scores: {'Recall': 17.42575, 'Precision': 3.64525}
-# MasterFixedChannels = [11,15] # T7, T8  #best ts 322_323  with Scores: {'Recall': 16.512999999999998, 'Precision': 3.3579999999999997}
-# MasterFixedChannels = [28] # O1 #best ts 125_126  with Scores: {'Recall': 16.359750000000002, 'Precision': 3.3274999999999997}
-# MasterFixedChannels = [30] # O2 #best ts 29_30  with Scores: {'Recall': 16.827499999999997, 'Precision': 3.41075}
-
-# MasterFixedChannels = [28,30,33,34,2,6,46,71]
-# MasterFixedChannels = [71]
-# MasterFixedChannels = [2,6,7,10,22,26,28,30,34,33] 
-# MasterFixedChannels = [2,6,7,10,22,26,28,30,34,33,51,52,55,56,60,71,75,79,106]
-
-# MasterFixedChannels = [33,46,49,71,35,91,48,31,105,51,52,39,105]
-
-ChanneWiseTS = {
-
-    # "2": [261,262],
-    # "6": [192,193],
-    # "2_6": [177,178],
-    # "28": [125,126],
-    # "30": [29,30],
-    # "28_30": [231,232],
-    # "33": [167,168],
-    # "34": [346,347],
-    # "46": [429,430], 
-    # "71": [125,126],
-
-    "2": [250,270],
-    "6": [180,200],
-    "2_6": [180,200],
-    "28": [130,150],
-    "30": [20,40],
-    "28_30": [240,260],
-    "33": [170,190],
-    "34": [350,370],
-    "46": [440,460], 
-    "71": [130,150],
-
-}
-
-MasterFixedChannels = [5]
-
-print("Fixed Channels: ")
-for MC in MasterFixedChannels:
-    print(f"{channelMap[MC+1]}", end=",")
-print()
-# for iteration in range(0,480,1):
-
-#     TimeStart = iteration
-#     TimeEnd = TimeStart + 1
-
-
-for i in range(128):
-
-    for ch in range(128):
+MasterFixedChannels = []
+for i in range(96):
+    for ch in range(96):
 
         if ch in MasterFixedChannels:
             continue
@@ -298,8 +226,8 @@ for i in range(128):
         for query_idx, search_res in enumerate(I):
             # print(search_res)
             labels = []
-            test_intlabel = test_dataset.labels[query_idx]
-            test_strlabel = test_dataset.class_id_to_str[test_intlabel]
+            test_intlabel = test_dataset.dataset.labels[query_idx]
+            test_strlabel = test_dataset.dataset.class_id_to_str[test_intlabel]
 
             cosine_similarities = []
             cosine_similarities_labels_int = []
@@ -307,12 +235,12 @@ for i in range(128):
             cosine_similarities_labels_classid = []
             cosine_similarities_images = []
 
-            test_intlabel = test_dataset.labels[query_idx]
-            test_strlabel = test_dataset.class_id_to_str[test_intlabel]
+            test_intlabel = test_dataset.dataset.labels[query_idx]
+            test_strlabel = test_dataset.dataset.class_id_to_str[test_intlabel]
 
             test_eeg, test_label, test_image, test_idx, img_f = test_dataset[query_idx]
             #originalImage = test_dataset.getOriginalImage(test_idx)
-            originalImage = test_dataset.getImagePath(test_idx)
+            originalImage = test_dataset.dataset.getImagePath(test_idx)
 
             if test_label["ClassName"] not in class_scores["data"]:
                 class_scores["data"][test_label["ClassName"]] = {"TP": 0, 
@@ -356,7 +284,7 @@ for i in range(128):
                 class_scores["data"][test_label["ClassName"]]["classIntanceRetrival"] +=classIntanceRetrival
                 class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_label["ClassId"])
             else:
-                class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_dataset.class_str_to_id[cosine_similarities_labels_str[0]])
+                class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_dataset.dataset.class_str_to_id[cosine_similarities_labels_str[0]])
 
                 
             class_scores["data"][test_label["ClassName"]]["TotalRetrival"] +=TotalRetrival
@@ -417,9 +345,9 @@ for i in range(128):
         MasterFixedChannels.append(currentbestChannel)
     else:
         print(f"found no channel better than last iteration. final channels: {MasterFixedChannels}")
-        for MC in MasterFixedChannels:
-            print(f"{channelMap[MC+1]}", end=",")
-        print()
+        # for MC in MasterFixedChannels:
+        #     print(f"{channelMap[MC+1]}", end=",")
+        # print()
         break
     # else:
     #     print(f"exiting since no best score is found")

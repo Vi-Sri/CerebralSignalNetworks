@@ -5,15 +5,20 @@ from torchvision import transforms
 from tqdm import tqdm
 from torch.utils.data import Dataset
 import cv2
+from utils import utils
+import torch.distributed as dist
 class EEGDataset(Dataset):
     # Constructor
     def __init__(self, eeg_signals_path, 
                  eeg_splits_path, subset='train',
                  subject=1, 
                  exclude_subjects=[],
+                 filter_channels=[],
                  time_low=20,time_high=480, 
                  model_type="cnn", 
-                 imagesRoot="./data/images/imageNet_images", 
+                 imagesRoot="./data/images/imageNet_images",
+                 apply_norm_with_stds_and_means=False,
+                 apply_channel_wise_norm=False,
                  preprocessin_fn=None,
                  Transform_EEG2Image_Shape=False,
                  convert_image_to_tensor=False,
@@ -28,6 +33,9 @@ class EEGDataset(Dataset):
         self.convert_image_to_tensor = convert_image_to_tensor
         self.perform_dinov2_global_Transform = perform_dinov2_global_Transform
         self.dinov2Config = dinov2Config
+        self.apply_norm_with_stds_and_means = apply_norm_with_stds_and_means
+        self.apply_channel_wise_norm = apply_channel_wise_norm
+        self.filter_channels = filter_channels
 
         self.time_low = time_low
         self.time_high = time_high
@@ -103,6 +111,10 @@ class EEGDataset(Dataset):
         self.isDataTransformed = False
         self.image_features_extracted = False
 
+        if self.apply_channel_wise_norm:
+
+            self.transformEEGDataToChannelWiseNorm()
+
 
     def __len__(self):
         return self.size
@@ -136,7 +148,7 @@ class EEGDataset(Dataset):
         return ImagePath
     
     @torch.no_grad()
-    def extract_features(self,model, data_loader, use_cuda=True, multiscale=False):
+    def extract_features(self,model, data_loader, use_cuda=True, multiscale=False, replace_eeg=True):
         metric_logger = utils.MetricLogger(delimiter="  ")
         features = None
         # for samples, index in metric_logger.log_every(data_loader, 10):
@@ -183,10 +195,13 @@ class EEGDataset(Dataset):
                     features.index_copy_(0, index_all.cpu(), torch.cat(output_l).cpu())
         
         for idx, f in enumerate(features):
-            self.subsetData[idx]["eeg"] = f.cpu().numpy()
-            # self.EEGs.append(f.cpu().numpy())
-        #return features
-    
+            if replace_eeg:
+                self.subsetData[idx]["eeg"] = f.cpu().numpy()
+            else:
+                self.image_features.append(f.cpu().numpy())
+
+        
+        self.image_features_extracted = True
 
     def resizeEEGToImageSize(self,input_data=None,imageShape=(224,224),index=None):
 
@@ -252,7 +267,6 @@ class EEGDataset(Dataset):
         return output_data
     
     def ExtractImageFeatures(self, preprocsessor, model, device):
-        print("Extracting Image features")
         for img_idx in tqdm(range(len(self.images)), total=len(len(self.images))):
             class_folder_name = self.images[img_idx].split("_")[0]
             ImagePath = f"{self.imagesRoot}/{class_folder_name}/{self.images[img_idx]}.JPEG"
@@ -265,13 +279,14 @@ class EEGDataset(Dataset):
                 features = last_hidden_states[:,0,:] # batch size, 257=CLS_Token+256,features_length
                 features = features.reshape(features.size(0), -1)
                 self.image_features.append(features)
-        print("Extracting Image features done")
         self.image_features_extracted = True
     
 
     
     def transformEEGData(self, resnet_model, resnet_to_eeg_model, device, isVIT=False):
         print("Transforming EEG data")
+        resnet_to_eeg_model = resnet_to_eeg_model.to(device)
+        resnet_model = resnet_model.to(device)
         for i, image_path in enumerate(self.images):
 
             class_folder_name = image_path.split("_")[0]
@@ -280,7 +295,6 @@ class EEGDataset(Dataset):
             image = Image.open(ImagePath).convert('RGB')
             if self.preprocessin_fn is not None:
                 image = self.preprocessin_fn(image)
-
             # eeg, label, image, idxs = data
             with torch.no_grad():
                 if isVIT:
@@ -288,8 +302,15 @@ class EEGDataset(Dataset):
                 else:
                     features = resnet_model(image.unsqueeze(0).to(device))
                     features = features.view(-1, features.size(1))
+                
                 outputs = resnet_to_eeg_model(features)
+
+                # outputs = outputs.cpu().numpy()
+                # outputs = outputs.reshape(128, -1)
+                # outputs = outputs[:,self.time_low:self.time_high]
                 self.subsetData[i]["eeg"] = outputs
+                # print("output shape : ", outputs.shape)
+                # self.subsetData[i]["eeg"] = outputs
                 # print("FC features shape", outputs.view(128,-1).size(), "original eeg shape: ", eeg.reshape(128,-1).size())
         self.isDataTransformed = True
         print("Transforming EEG data (done)")
@@ -371,31 +392,111 @@ class EEGDataset(Dataset):
         self.isDataTransformed = True
         # print("Transforming EEG data to dino EEG features (done)")
 
+    
+    def normlizeEEG(self, EEG, ch_index, class_index=None):
+        ChannelEEG = EEG[: , ch_index]
+        ChanneLMean = ChannelEEG.mean()
+        ChanneLStd = ChannelEEG.std()
+        NormlizedChannelEEG = (ChannelEEG-ChanneLMean)/ChanneLStd
+        # NormlizedChannelEEG[NormlizedChannelEEG > 0] = 0
+        EEG[:,ch_index] = NormlizedChannelEEG
+        return EEG
+    
+
+    def transformEEGDataToChannelWiseNorm(self):
+        print("Transforming data to channel wise norm across labels")
+        label_wise_data = {}
+        channel_wise_mean_std = {}
+        for i in range(len(self)):
+            eeg, label, image, i ,img_f = self[i]
+            if not label["ClassId"] in label_wise_data:
+                label_wise_data[label["ClassId"]] = {"images":[], "eeg":[], "original_indexes": []}
+            label_wise_data[label["ClassId"]]["images"].append(image)
+            label_wise_data[label["ClassId"]]["eeg"].append(eeg.numpy())
+            label_wise_data[label["ClassId"]]["original_indexes"].append(i)
+
+        
+        for label, labelData in label_wise_data.items():
+            # print(label, len(labelData["eeg"]))
+            channel_wise_mean_std = {}
+            eegs = labelData["eeg"]
+            timeSpan, channels = eegs[0].shape
+            for eeg in eegs:
+                for ch in range(channels):
+                    ch_mean = eeg[:, ch].mean()
+                    ch_std = eeg[:, ch].std()
+
+                    if ch not in channel_wise_mean_std:
+                        channel_wise_mean_std[ch] = {
+                            "stds": [],
+                            "means": [],
+                            "mean": 0,
+                            "std": 0
+                        }
+                    
+                    channel_wise_mean_std[ch]["stds"].append(ch_std)
+                    channel_wise_mean_std[ch]["means"].append(ch_mean)
+
+            
+            for idxes in labelData["original_indexes"]:
+
+                eeg = self.subsetData[idxes]["eeg"].float()
+                eeg = eeg.cpu().numpy()
+                for ch in range(channels):
+                    meanStd = np.array(channel_wise_mean_std[ch]["stds"]).mean()
+                    meanMean= np.array(channel_wise_mean_std[ch]["means"]).mean()
+                    eeg[:,ch] = (eeg[:,ch]-meanMean)/meanStd
+                self.subsetData[i]["eeg"] = torch.from_numpy(eeg)
+
+
+        # for ch in range(128):
+        #     meanStd = np.array(channel_wise_mean_std[ch]["stds"]).mean()
+        #     meanMean= np.array(channel_wise_mean_std[ch]["means"]).mean()
+        #     channel_wise_mean_std[ch]["mean"] = meanMean
+        #     channel_wise_mean_std[ch]["std"] = meanStd
+
+        
+        # for i, image_path in tqdm(enumerate(self.images), total=len(self.images)):
+        #     eeg = self.subsetData[i]["eeg"].float()
+        #     eeg = eeg.cpu().numpy()
+        #     for ch in range(128):
+        #         eeg[:,ch] = (eeg[:,ch]-channel_wise_mean_std[ch]["mean"])/channel_wise_mean_std[ch]["std"]
+        #     self.subsetData[i]["eeg"] = torch.from_numpy(eeg)
+
+        print("Transforming data to channel wise norm across labels (done)")
+
 
     def __getitem__(self, i):
         eeg = self.subsetData[i]["eeg"].float()
-        # print("eeg shape", eeg.shape)
-        # print("EE sample size",self.subsetData[i]["eeg"].size())
-        # eeg = self.subsetData[i]["eeg"].T
-        # if not self.isDataTransformed:
-        #     print("slicing time")
-        #     eeg = eeg[self.time_low:self.time_high,:]
 
+        # print("original shape", eeg.size())
+        
         if self.Transform_EEG2Image_Shape:
-            # print("transforming to image size")
             eeg = eeg.cpu().numpy().T
             eeg = self.resizeEEGToImageSize(eeg)
             eeg = torch.from_numpy(eeg)
         else:
-            # print("eeg before transf", eeg.shape)
             eeg = eeg.t()
 
-        # print("eeg transf", eeg.shape)
-
         if not self.isDataTransformed:
-            eeg = eeg[self.time_low:self.time_high,:]
+            if len(self.filter_channels)>0:
+                eeg = eeg.cpu().numpy()
+                eeg_zeros = np.zeros((self.time_high-self.time_low, len(self.filter_channels)), dtype=eeg.dtype)
+                # print(f"eeg shape: {eeg.shape} eeg zeros shape: {eeg_zeros.shape}")
+                for ch_idx, ch in enumerate(self.filter_channels):
+                    # print(f" sliced: {eeg[self.time_low:self.time_high,ch].shape}")
+                    eeg_zeros[:,ch_idx] = eeg[self.time_low:self.time_high,ch]
+                    if self.apply_channel_wise_norm:
+                        eeg_zeros = self.normlizeEEG(EEG=eeg_zeros,ch_index=ch_idx,class_index=None)
+                eeg = torch.from_numpy(eeg_zeros).t()
+                # print(f"final EEG : {eeg.size()}")
+            else:
+                # if self.apply_channel_wise_norm:
+                #     for ch_idx in range(eeg.shape[-1]):
+                #         eeg = self.normlizeEEG(EEG=eeg,ch_index=ch_idx,class_index=None)
+                eeg = eeg[self.time_low:self.time_high,:]
 
-        # print("eeg  after time slice", eeg.shape)
+        # print("final shape", eeg.size())
 
         class_folder_name = self.images[i].split("_")[0]
         ImagePath = f"{self.imagesRoot}/{class_folder_name}/{self.images[i]}.JPEG"
@@ -412,7 +513,6 @@ class EEGDataset(Dataset):
             if self.convert_image_to_tensor:
                 image = self.transform(image)
                 # print(image.size())
-
         if self.image_features_extracted==True and len(self.image_features)==len(self.images):
             image_features = self.image_features[i]
         else:
