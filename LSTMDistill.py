@@ -19,10 +19,10 @@ from utils import utils
 
 
 class Paramters:
-    ce_weight = 0.25
-    soft_labels_weight = 0.75
+    ce_loss_weight = 0.25
+    soft_target_loss_weight = 0.75
     alpha = 1
-    temperature = 1
+    temperature = 2
 
 
 def loss_fn_kd(student_logits, labels, teacher_logits, params):
@@ -46,10 +46,16 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
     # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
     soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
 
+    # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
+
+    mse_loss = F.mse_loss(student_logits, teacher_logits)
+                        
+    # Weighted sum of the two losses
+    loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
 
     # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), F.softmax(teacher_outputs/T, dim=1))
 
-    return soft_targets_loss
+    return loss
 
 
 
