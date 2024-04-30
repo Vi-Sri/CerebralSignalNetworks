@@ -331,7 +331,7 @@ class EEGDataset(Dataset):
             # print(samples.shape)
             samples = samples.cuda(non_blocking=True)
 
-            features, cls_ = model(samples)
+            features = model(samples)
 
             for idx, feat in enumerate(features):
                 image_features.append(feat.cpu().numpy())

@@ -196,7 +196,7 @@ if __name__=="__main__":
                         help='type of mode train or test')
     parser.add_argument('--custom_model_weights',
                         type=str,
-                        default="./weights/checkpoint.pth",
+                        default="./weights/checkpoint0190.pth",
                         help='custom model weights')
     parser.add_argument('--dino_base_model_weights',
                         type=str,
@@ -302,9 +302,15 @@ if __name__=="__main__":
     features_length = outs.size(-1)
     print(outs.size())
 
+    embed_dim = 128
+    # lstm_embedding_dim = 128
+
+    LSTM_model = Model(input_size=96,lstm_size=embed_dim,lstm_layers=4,output_size=embed_dim, include_top=False)
+    loaded_state_dict = torch.load(FLAGS.custom_model_weights)
+    loaded_state_dict = {k.replace("backbone.", ""): v for k, v in loaded_state_dict["teacher"].items()}
+    print(loaded_state_dict.keys())
     
-    LSTM_model = Model(input_size=96,lstm_size=100,lstm_layers=4,output_size=features_length, include_top=False)
-    LSTM_model.load_state_dict(torch.load(FLAGS.custom_model_weights)["teacher"])
+    LSTM_model.load_state_dict(loaded_state_dict,strict=False)
     print(f"Loaded: {FLAGS.custom_model_weights}")
     LSTM_model.to(device)
     LSTM_model.eval()
