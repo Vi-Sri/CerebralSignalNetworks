@@ -179,8 +179,6 @@ def main_worker(gpu, args):
                    args.checkpoint_dir / 'resnet50.pth')
 
 
-
-
 def handle_sigusr1(signum, frame):
     os.system(f'scontrol requeue {os.getenv("SLURM_JOB_ID")}')
     exit()
@@ -188,8 +186,6 @@ def handle_sigusr1(signum, frame):
 
 def handle_sigterm(signum, frame):
     pass
-
-
 
 if __name__ == '__main__':
     main()
