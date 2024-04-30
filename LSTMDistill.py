@@ -19,13 +19,45 @@ from utils import utils
 
 
 class Parameters:
-    ce_loss_weight = 0.50
-    soft_target_loss_weight = 0.50
-    alpha = 1
-    temperature = 2
+    ce_loss_weight = 0.95
+    mse_loss_weight = 0.20
+    soft_target_loss_weight = 0.05
+    alpha = 0.5
+    temperature = 5
 
+class CosineSimilarityLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cosine_similarity = nn.CosineSimilarity()
 
-def loss_fn_kd(student_logits, labels, teacher_logits, params):
+    def forward(self, student_outputs, teacher_outputs):
+        loss = 1 - self.cosine_similarity(student_outputs, teacher_outputs).mean()
+        return loss
+
+def cosine_similarity_loss(v1, v2):
+    """
+    Compute the cosine similarity loss between two feature vectors.
+
+    Args:
+        v1 (torch.Tensor): First feature vector (shape: [batch_size, feature_dim]).
+        v2 (torch.Tensor): Second feature vector (shape: [batch_size, feature_dim]).
+
+    Returns:
+        torch.Tensor: Cosine similarity loss.
+    """
+    # Normalize the vectors
+    v1_normalized = F.normalize(v1, p=2, dim=1)
+    v2_normalized = F.normalize(v2, p=2, dim=1)
+
+    # Compute cosine similarity
+    cosine_sim = torch.sum(v1_normalized * v2_normalized, dim=1)
+
+    # Define the loss as negative cosine similarity
+    loss = -torch.mean(cosine_sim)
+
+    return loss
+
+def loss_fn_kd(student_logits, teacher_logits,gt_labels, pred_labels, params:Parameters):
     """
     Compute the knowledge-distillation (KD) loss given outputs, labels.
     "Hyperparameters": temperature and alpha
@@ -40,20 +72,27 @@ def loss_fn_kd(student_logits, labels, teacher_logits, params):
     #           F.cross_entropy(outputs, labels) * (1. - alpha)
 
     #Soften the student logits by applying softmax first and log() second
-    soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1).to(device)
-    soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1).to(device)
+    # soft_targets = nn.functional.softmax(teacher_logits, dim=-1).to(device)
+    # soft_prob = nn.functional.log_softmax(student_logits, dim=-1).to(device)
 
     # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
-    soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
+    # soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
 
-    # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
+    # gt_labels = gt_labels.view(gt_labels.size(0), 1).float()
+    # print(pred_labels.size(), gt_labels.size())
+    # ce_loss = F.cross_entropy(nn.functional.softmax(pred_labels.float(),dim=-1), gt_labels.float())
 
-    mse_loss = F.mse_loss(student_logits, teacher_logits)
+    cosine_loss = cosine_similarity_loss(student_logits, teacher_logits)
+
+    # mse_loss = F.mse_loss(student_logits, teacher_logits) * params.mse_loss_weight
                         
     # Weighted sum of the two losses
-    loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
+    # loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
+    # KD_loss = nn.KLDivLoss()(F.log_softmax(student_logits/T, dim=1), F.softmax(teacher_logits/T, dim=1) * (alpha * T * T) + ce_loss * (1. - alpha))
 
-    # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), F.softmax(teacher_outputs/T, dim=1))
+
+    # loss = ce_loss * params.ce_loss_weight + soft_targets_loss * params.soft_target_loss_weight
+    loss = cosine_loss
 
     return loss
 
@@ -71,13 +110,14 @@ def initDinoV2Model(model= "dinov2_vits14"):
 
 # Define the LSTM model
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, n_layers=2, out_features=384):
+    def __init__(self, input_size, hidden_size, n_layers=4, out_features=384, number_of_classes=40):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.n_layer = n_layers
         self.input_size = input_size
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=n_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, out_features)
+        self.class_pred = nn.Linear(out_features, number_of_classes)
     
     def forward(self, x):
         batch_size, timespan, channels = x.size()
@@ -87,14 +127,19 @@ class LSTMModel(nn.Module):
         lstm_init = (Variable(lstm_init[0], volatile=x.volatile), Variable(lstm_init[1], volatile=x.volatile))
 
         # Forward LSTM and get final state
-        x = self.lstm(x, lstm_init)[0][:,-1,:]
+        # x = self.lstm(x, lstm_init)[0][:,-1,:]
+
+        lstm_out, (ht, ct) = self.lstm(x)
+
+        print(lstm_out.size(), ht.size(), ct.size())
 
         # hx0, hx1 =  self.lstm(x, lstm_init)[1]
         # print(hx0.size(), hx1.size())
         # x = F.softmax(self.fc(x))
-        x = self.fc(x)
-
-        return x
+        x = self.fc(lstm_out)
+        cls_pred = self.class_pred(x)
+        x = nn.functional.relu(x)
+        return x, cls_pred
         # h0 = torch.zeros(self.n_layer, x.size(0), self.hidden_size)
         # c0 = torch.zeros(self.n_layer, x.size(0), self.hidden_size)
         # lstm_out, hidden_out = self.lstm(x, (h0, c0))
@@ -136,7 +181,7 @@ if __name__=="__main__":
                         help='Dataset to train')
     parser.add_argument('--images_root',
                         type=str,
-                        default="./data/images/",
+                        default="./data/images/imageNet_images",
                         help='Dataset to train')
     parser.add_argument('--eeg_dataset_split',
                         type=str,
@@ -234,7 +279,9 @@ if __name__=="__main__":
                          exclude_subjects=[],
                          convert_image_to_tensor=False,
                          apply_channel_wise_norm=False,
-                         preprocessin_fn=transform_image)
+                         preprocessin_fn=transform_image,
+                         inference_mode=False,
+                         onehotencode_label=True)
 
 
     eeg, label,image,i, image_features =  dataset[0]
@@ -268,11 +315,12 @@ if __name__=="__main__":
     model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=features_length, n_layers=4)
     model.to(device)
 
-    output = model(eeg.to(device))
+    output, cls_pred = model(eeg.to(device))
     print(output.size())    
 
 
     opt = torch.optim.Adam(lr=learning_rate, params=model.parameters())
+    criterion = CosineSimilarityLoss()
 
     epoch_losses = []
     val_epoch_losses = []
@@ -290,10 +338,17 @@ if __name__=="__main__":
             image_features = torch.from_numpy(np.array(image_features)).to(device)
 
             opt.zero_grad()
-            lstm_output = model(eeg.to(device))
+            lstm_output, cls_pred = model(eeg.to(device))
 
-            loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Parameters)
-            batch_losses.append(loss.item())
+            # loss = loss_fn_kd(student_logits=lstm_output,
+            #                   teacher_logits=image_features, 
+            #                   gt_labels=label.to(device),
+            #                   pred_labels=cls_pred,
+            #                   params=Parameters)
+            loss = criterion(lstm_output, image_features)
+            
+            
+            batch_losses.append(loss.cpu().item())
 
             loss.backward()
             opt.step()
@@ -305,15 +360,21 @@ if __name__=="__main__":
 
             with torch.no_grad():
                 image_features = torch.from_numpy(np.array(image_features)).to(device)
-                lstm_output = model(eeg.to(device))
-                loss = loss_fn_kd(student_logits=lstm_output,labels=None,teacher_logits=image_features, params=Parameters)
-                val_batch_losses.append(loss.item())
+                lstm_output, cls_pred = model(eeg.to(device))
+                # loss = loss_fn_kd(student_logits=lstm_output,
+                #               teacher_logits=image_features, 
+                #               gt_labels=label.to(device),
+                #               pred_labels=cls_pred,
+                #               params=Parameters)
+                loss = criterion(lstm_output,image_features)
+                loss = loss.cpu().item()
+                val_batch_losses.append(loss)
 
                 if best_val_loss is None:
-                    best_val_loss = loss.item()
+                    best_val_loss = loss
                 else:
-                    if loss.item()<best_val_loss:
-                        best_val_loss = loss.item()
+                    if loss<best_val_loss:
+                        best_val_loss = loss
                         torch.save(model.state_dict(), f"{FLAGS.log_dir}/lstm_dinov2_best_loss.pth")
         
         batch_losses = np.array(batch_losses)

@@ -23,7 +23,11 @@ class EEGDataset(Dataset):
                  Transform_EEG2Image_Shape=False,
                  convert_image_to_tensor=False,
                  perform_dinov2_global_Transform=False,
-                 dinov2Config=None):
+                 dinov2Config=None,
+                 inference_mode=True,
+                 onehotencode_label=False,
+                 data_augment_eeg=False,
+                 add_channel_dim_to_eeg=False):
         # Load EEG signals
 
         assert subset=='train' or subset=='val' or subset=='test'
@@ -36,6 +40,10 @@ class EEGDataset(Dataset):
         self.apply_norm_with_stds_and_means = apply_norm_with_stds_and_means
         self.apply_channel_wise_norm = apply_channel_wise_norm
         self.filter_channels = filter_channels
+        self.inference_mode = inference_mode
+        self.onehotencode_label = onehotencode_label
+        self.data_augment_eeg = data_augment_eeg
+        self.add_channel_dim_to_eeg = add_channel_dim_to_eeg
 
         self.time_low = time_low
         self.time_high = time_high
@@ -79,10 +87,20 @@ class EEGDataset(Dataset):
                     self.class_id_to_str[int(indexOfClass)]= imagenetClassName
                     self.class_str_to_id[imagenetClassName]= int(indexOfClass)
         
+        self.std = 0
+        self.mean = 0
+        cnt = 0
+        
         for i in range(len(loaded["dataset"])):
+            self.mean += loaded['dataset'][i]["eeg"].mean()
+            self.std  += loaded['dataset'][i]["eeg"].std()
+            cnt +=1
             self.subsetData.append(loaded['dataset'][i])
             self.labels.append(loaded["dataset"][i]['label'])
             self.images.append(image_names[loaded["dataset"][i]['image']])
+
+        self.mean = self.mean/cnt
+        self.std = self.std/cnt
 
         # Compute size
         self.size = len(self.subsetData)
@@ -197,9 +215,11 @@ class EEGDataset(Dataset):
                     features.index_copy_(0, index_all.cpu(), torch.cat(output_l).cpu())
         
         for idx, f in enumerate(features):
+            # img_features = f.cpu().numpy()
             if replace_eeg:
                 self.subsetData[idx]["eeg"] = f.cpu().numpy()
             else:
+                # print(f"feature shape: {img_features.shape}")
                 self.image_features.append(f.cpu().numpy())
 
         
@@ -288,16 +308,37 @@ class EEGDataset(Dataset):
     def transformEEGDataLSTM(self, lstm_model,device, replaceEEG=True):
         lstm_model.to(device)
         lstm_model.eval()
-        self.image_features = [i for i in range(len(self))]
+        if not replaceEEG:
+            self.image_features = [i for i in range(len(self))]
+
         for i in range(len(self)):
             eeg, label,image,i, image_features = self[i]
-
             with torch.no_grad():
                 lstm_output = lstm_model(eeg.unsqueeze(0).to(device))
                 if replaceEEG:
                     self.subsetData[i]["eeg"] = lstm_output
                 else:
                     self.image_features[i] = lstm_output
+    
+    @torch.no_grad()
+    def transformEEGDataLSTMByList(self, model, data_loader):
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        # for samples, index in metric_logger.log_every(data_loader, 10):
+        image_features = []
+        image_labels = []
+        for EEG,labels,image, index, img_feat in metric_logger.log_every(data_loader, 10):
+            samples = EEG
+            # print(samples.shape)
+            samples = samples.cuda(non_blocking=True)
+
+            features, cls_ = model(samples)
+
+            for idx, feat in enumerate(features):
+                image_features.append(feat.cpu().numpy())
+                image_labels.append(data_loader.dataset.dataset.getLabelbyIndex(idx))
+
+        # print(f"Image features: {len(image_features)} Labels :{len(image_labels)} ")
+        return image_features,image_labels
 
 
     def transformEEGData(self, resnet_model, resnet_to_eeg_model, device, isVIT=False):
@@ -483,6 +524,20 @@ class EEGDataset(Dataset):
         print("Transforming data to channel wise norm across labels (done)")
 
 
+    
+    def getLabelbyIndex(self, i):
+        class_folder_name = self.images[i].split("_")[0]
+        label = self.class_labels_names[class_folder_name]
+        if not self.inference_mode:
+            label = label["ClassId"]
+            if self.onehotencode_label:
+                onehot = [0 for i in range(len(self.class_labels_names))]
+                onehot[label] = 1
+                label = onehot
+                label = np.array(label)
+                label = torch.from_numpy(label)
+        return label
+
     def __getitem__(self, i):
         eeg = self.subsetData[i]["eeg"].float()
 
@@ -513,12 +568,42 @@ class EEGDataset(Dataset):
                 #         eeg = self.normlizeEEG(EEG=eeg,ch_index=ch_idx,class_index=None)
                 eeg = eeg[self.time_low:self.time_high,:]
 
+        
+        if self.apply_norm_with_stds_and_means:
+            eeg = (eeg-self.mean)/ self.std
+        
+        if self.data_augment_eeg:
+            channel_norm_eeg = eeg
+            for idx_channel in range(32):
+                channel_index = np.random.randint(0, channel_norm_eeg.size(-1))
+                channel_norm_eeg = self.normlizeEEG(channel_norm_eeg,ch_index=channel_index, class_index=None)
+
+            z2Scoring = eeg
+            fmean = z2Scoring.mean()
+            fstd = z2Scoring.std()
+            z2Scoring = (z2Scoring - fmean)/fstd
+            
+            # eeg_fft = torch.from_numpy(np.fft.fft(eeg.cpu().numpy()))
+            eeg = torch.stack((eeg,channel_norm_eeg,z2Scoring))
+
+        if self.add_channel_dim_to_eeg:
+            eeg = eeg.unsqueeze(0)
+
         # print("final shape", eeg.size())
 
         class_folder_name = self.images[i].split("_")[0]
         ImagePath = f"{self.imagesRoot}/{class_folder_name}/{self.images[i]}.JPEG"
 
         label = self.class_labels_names[class_folder_name]
+
+        if not self.inference_mode:
+            label = label["ClassId"]
+            if self.onehotencode_label:
+                onehot = [0 for i in range(len(self.class_labels_names))]
+                onehot[label] = 1
+                label = onehot
+                label = np.array(label)
+                label = torch.from_numpy(label)
 
         image = Image.open(ImagePath).convert('RGB')
         if self.preprocessin_fn is not None:
