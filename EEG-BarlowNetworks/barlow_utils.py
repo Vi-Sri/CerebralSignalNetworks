@@ -51,8 +51,11 @@ class BarlowTransform:
         return y
     
 def convertsignaltomelspectrogram(signal, sr, n_mels=224, fmin=0.0, fmax=None, duration=10):
-    mel_spectrogram = librosa.feature.melspectrogram(y=signal, sr=sr, n_mels=n_mels, fmin=fmin, fmax=fmax)
-    mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
-    mel_spectrogram = mel_spectrogram[:, :int(duration * sr / 512)]
-    mel_spectrogram = np.stack([mel_spectrogram, mel_spectrogram, mel_spectrogram], axis=-1)
-    return mel_spectrogram # shape: (224, 224, 3)
+    mel_spectrograms = []
+    for channel in signal:
+        mel_spec = librosa.feature.melspectrogram(channel, sr=sr, n_mels=n_mels, fmin=fmin, fmax=fmax, duration=duration)
+        mel_spec = np.stack([mel_spec, mel_spec, mel_spec], axis=-1)
+        mel_spectrograms.append(mel_spec)
+    mel_spectrograms = np.stack(mel_spectrograms)
+    return mel_spectrograms
+    
