@@ -5,8 +5,6 @@ Applying Barlow twins for EEG-Image Cross modality Self supervised learning
 ## Table of Contents
 
 - [Usage](#usage)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Usage
 
@@ -32,12 +30,3 @@ srun python -m torch.distributed.launch \
     --checkpoint-dir /path/to/checkpoints
 
 ```
-
-
-## Contributing
-
-Guidelines on how to contribute to the project and any specific requirements.
-
-## License
-
-Information about the project's license and any additional terms or conditions.
