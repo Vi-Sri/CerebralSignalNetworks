@@ -25,7 +25,9 @@ class EEGDataset(Dataset):
                  Transform_EEG2Image_Shape=False,
                  convert_image_to_tensor=False,
                  perform_dinov2_global_Transform=False,
-                 dinov2Config=None):
+                 dinov2Config=None,
+                 inference_mode=True,
+                 onehotencode_label=False):
         # Load EEG signals
 
         assert subset=='train' or subset=='val' or subset=='test'
@@ -38,6 +40,8 @@ class EEGDataset(Dataset):
         self.apply_norm_with_stds_and_means = apply_norm_with_stds_and_means
         self.apply_channel_wise_norm = apply_channel_wise_norm
         self.filter_channels = filter_channels
+        self.inference_mode = inference_mode
+        self.onehotencode_label = onehotencode_label
 
         self.time_low = time_low
         self.time_high = time_high
@@ -58,7 +62,7 @@ class EEGDataset(Dataset):
         self.class_labels = loaded["labels"]
         image_names = loaded['images']
 
-        stddevsfile = "./data/eeg/eeg_signals_raw_with_mean_std.pth"
+        stddevsfile = eeg_signals_path
         stddevsfile_loaded = torch.load(stddevsfile)
         try:
             self.eeg_stds  = stddevsfile_loaded["stddevs"]
@@ -427,6 +431,25 @@ class EEGDataset(Dataset):
         # print("Transforming EEG data to dino EEG features (done)")
 
     
+    @torch.no_grad()
+    def transformEEGDataLSTMByList(self, model, data_loader):
+        metric_logger = utils.MetricLogger(delimiter="  ")
+        # for samples, index in metric_logger.log_every(data_loader, 10):
+        image_features = []
+        image_labels = []
+        for EEG,labels,image, index, img_feat in metric_logger.log_every(data_loader, 10):
+            samples = EEG
+            samples = samples.cuda(non_blocking=True)
+
+            features = model(samples).clone()
+
+            for idx, feat in enumerate(features):
+                image_features.append(feat.cpu().numpy())
+                image_labels.append(data_loader.dataset.dataset.getLabelbyIndex(idx))
+
+        # print(f"Image features: {len(image_features)} Labels :{len(image_labels)} ")
+        return image_features,image_labels
+    
     def normlizeEEG(self, EEG, ch_index, class_index=None):
         ChannelEEG = EEG[: , ch_index]
         ChanneLMean = ChannelEEG.mean()
@@ -498,6 +521,19 @@ class EEGDataset(Dataset):
         #     self.subsetData[i]["eeg"] = torch.from_numpy(eeg)
 
         print("Transforming data to channel wise norm across labels (done)")
+
+    def getLabelbyIndex(self, i):
+        class_folder_name = self.images[i].split("_")[0]
+        label = self.class_labels_names[class_folder_name]
+        if not self.inference_mode:
+            label = label["ClassId"]
+            if self.onehotencode_label:
+                onehot = [0 for i in range(len(self.class_labels_names))]
+                onehot[label] = 1
+                label = onehot
+                label = np.array(label)
+                label = torch.from_numpy(label)
+        return label
 
 
     def __getitem__(self, i):

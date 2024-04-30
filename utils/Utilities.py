@@ -6,9 +6,200 @@ import torch
 import matplotlib.pyplot as plt
 import logging
 from tqdm import tqdm
+import json
+import faiss
+import time
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NpEncoder, self).default(obj)
 
 def initlogger(name):
     return logging.getLogger(name=name)
+
+
+
+def evaluate(FLAGS,gallery_features,query_features,gallery_labels,query_labels,dataset, ):
+
+    time_t0 = time.perf_counter()
+
+    gallery_features = torch.from_numpy(np.array(gallery_features))
+    query_features = torch.from_numpy(np.array(query_features))
+    gallery_features = gallery_features.reshape(gallery_features.size(0), -1)
+    query_features = query_features.reshape(query_features.size(0), -1)
+
+    # query_features = gallery_features
+    print(gallery_features.shape, query_features.shape)
+    
+
+    d = gallery_features.size(-1)    # dimension
+    nb = gallery_features.size(0)    # database size
+    nq = query_features.size(0)      # nb of queries
+    
+    index = faiss.IndexFlatL2(d)   # build the index
+    print(index.is_trained)
+    index.add(gallery_features)    # add vectors to the index
+    print(index.ntotal)
+
+    topK  = FLAGS.topK
+    k = FLAGS.topK                          # we want to see 4 nearest neighbors
+    D, I = index.search(gallery_features[:5], k) # sanity check
+    print(I)
+    print(D)
+    D, I = index.search(query_features, k)     # actual search
+    print(I[:5])                   # neighbors of the 5 first queries
+    # print(I[-5:])                # neighbors of the 5 last queries
+
+    class_scores = {"data" :{}, "metadata": {}}
+    class_scores["metadata"] = {"flags": FLAGS}
+    print_done = False
+
+    
+    for query_idx, search_res in enumerate(I):
+        # print(search_res)
+        labels = []
+        # test_intlabel = test_dataset.dataset.labels[query_idx]
+        # test_strlabel = test_dataset.dataset.class_id_to_str[test_intlabel]
+        test_intlabel = query_labels[query_idx]["ClassId"]
+        test_strlabel = dataset.class_id_to_str[test_intlabel]
+        test_label = query_labels[query_idx]
+
+        cosine_similarities = []
+        cosine_similarities_labels_int = []
+        cosine_similarities_labels_str = []
+        cosine_similarities_labels_classid = []
+        cosine_similarities_images = []
+
+
+        # test_eeg, test_label, test_image, test_idx, img_f = test_dataset[query_idx]
+
+        # student_mean, student_std = test_eeg.mean(), test_eeg.std()
+        # print(img_f)
+        # teacher_mean, teacher_std = img_f.mean(), img_f.std()
+        # print(f"Student mean {student_mean} std: {student_std}  Teacher mean:{teacher_mean}  std:{teacher_std}")
+        #originalImage = test_dataset.getOriginalImage(test_idx)
+        # originalImage = test_dataset.dataset.getImagePath(test_idx)
+        originalImage = ""
+
+        if test_label["ClassName"] not in class_scores["data"]:
+            class_scores["data"][test_label["ClassName"]] = {"TP": 0, 
+                                                    "classIntanceRetrival": 0,
+                                                    "TotalRetrival": 0,
+                                                    "TotalClass": 0, 
+                                                    "input_images": [],
+                                                    "GroundTruths": [], 
+                                                    "Predicted":[], 
+                                                    "Topk": {
+                                                        "labels": [], 
+                                                        "scores": [],
+                                                        "images": []
+                                                        },
+                                                    "Recall": "",
+                                                    "Precision": ""
+                                                    }
+            
+        for search_res_idx in search_res:
+            intlabel = gallery_labels[search_res_idx]["ClassId"]
+            # intlabel = dataset.dataset.labels[search_res_idx]
+            strLabel = dataset.class_id_to_str[intlabel]
+            cosine_similarities_labels_str.append(strLabel)
+            cosine_similarities_labels_int.append(intlabel)
+                
+        cosine_similarities.append(list(D[query_idx]))
+        unique, counts = np.unique(cosine_similarities_labels_str, return_counts=True)
+        count = 0
+        count_label = ""
+        
+        for u, c in zip(unique, counts):
+            if u==test_strlabel:
+                count = c
+                count_label = u
+        
+        classIntanceRetrival = count
+        TotalRetrival = topK
+
+
+        if test_label["ClassName"] in cosine_similarities_labels_str:
+            class_scores["data"][test_label["ClassName"]]["TP"] +=1
+            class_scores["data"][test_label["ClassName"]]["classIntanceRetrival"] +=classIntanceRetrival
+            class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_label["ClassId"])
+        else:
+            class_scores["data"][test_label["ClassName"]]["Predicted"].append(dataset.class_str_to_id[cosine_similarities_labels_str[0]])
+
+            
+        class_scores["data"][test_label["ClassName"]]["TotalRetrival"] +=TotalRetrival
+        class_scores["data"][test_label["ClassName"]]["TotalClass"] +=1
+
+        class_scores["data"][test_label["ClassName"]]["Topk"]["labels"].append(list(cosine_similarities_labels_str))
+        class_scores["data"][test_label["ClassName"]]["Topk"]["scores"].append(list(cosine_similarities))
+        class_scores["data"][test_label["ClassName"]]["Topk"]["images"].append(list(cosine_similarities_images))
+        
+        class_scores["data"][test_label["ClassName"]]["input_images"].append(originalImage)
+        class_scores["data"][test_label["ClassName"]]["GroundTruths"].append(test_label["ClassId"])
+
+        TP  = class_scores["data"][test_label["ClassName"]]['TP']
+        TotalClass = class_scores["data"][test_label["ClassName"]]['TotalClass']
+        classIntanceRetrival = class_scores["data"][test_label["ClassName"]]['classIntanceRetrival']
+        TotalRetrival = class_scores["data"][test_label["ClassName"]]['TotalRetrival']
+
+        class_scores["data"][test_label["ClassName"]]["Recall"] = round(((TP*100)/TotalClass), 2)
+        class_scores["data"][test_label["ClassName"]]["Precision"] = round(((classIntanceRetrival*100)/TotalRetrival), 2)
+
+
+    Recall_Total = []
+    Precision_Total = []
+    for key, cls_data in class_scores["data"].items():
+        # print(f"Class : {key} Recall: [{cls_data['Recall']}] Precision: [{cls_data['Precision']}]" )
+        Recall_Total.append(cls_data["Recall"])
+        Precision_Total.append(cls_data["Precision"])
+
+    Recall_Total = np.array(Recall_Total).mean()
+    Precision_Total = np.array(Precision_Total).mean()
+    print(f"Overall Recall :{Recall_Total} Overall Precision: {Precision_Total}")
+    
+
+    time_tn = time.perf_counter()
+
+    return Recall_Total, Precision_Total
+    # outputPath = f"{output_dir}/Scores.pth"
+    # class_scores["metadata"] = {"processing_time": f"{time_tn-time_t0:.2f}s"}
+    
+    # torch.save(class_scores, outputPath)
+
+    # with open(f"{output_dir}/Scores.txt", 'w') as f:
+        # json.dump(class_scores, f, indent=2, cls=NpEncoder)
+
+    # pthFiles = [outputPath]
+    # csv_file = open(f"{output_dir}/retreival_.csv", "w")
+    # csv_file.write(f"srno, label, imagenet_label, Total class images,Total class image Retr, TP,Total Images Retr, Recall, Precision")
+    # cnt = 1
+    # for pth in pthFiles:
+    #     class_metrics = torch.load(pth)
+    #     filename = pth.split("train")[-1].split(".")[0]
+    #     filename  = filename[1:]
+    #     for key,val1 in class_metrics.items():
+    #         if key=="data":
+    #             val1 = dict(sorted(val1.items()))
+    #             for classN, classData in val1.items():
+    #                 TP  = classData['TP']
+    #                 TotalClass = classData['TotalClass']
+    #                 classIntanceRetrival = classData['classIntanceRetrival']
+    #                 TotalRetrival = classData['TotalRetrival']
+    #                 Recall = classData['Recall']
+    #                 Precision = classData['Precision']
+    #                 print(f"Class:{classN} TP: [{classData['TP']}] TotalClass: [{classData['TotalClass']}] classIntanceRetrival: [{classData['classIntanceRetrival']}] TotalRetrival: [{classData['TotalRetrival']}] ")
+    #                 # csv_file.write(f"\n {cnt}, {filename}, {classN}, {TotalClass},{TotalRetrival},{TP},{classIntanceRetrival},{Recall},{Precision}")
+    #                 cnt +=1
+    # csv_file.write(f"\n\n,,,,,,,{Recall_Total},{Precision_Total}")                    
+    # csv_file.close()
+    
+    print(f"Completed in : {time_tn-time_t0:.2f}")
 
 class Utilities:
     def __init__(self) -> None:

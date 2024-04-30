@@ -1,122 +1,157 @@
+from utils.PerilsEEGDataset import EEGDataset
+from utils.Utilities import Utilities, NpEncoder
 import torch
-import argparse
+from torch.utils.data import DataLoader
+from models.lstm import Model
 import os
+import argparse
+from torchvision import transforms, datasets
+from utils import utils
+import numpy as np
 import torch.nn as nn
-import uuid
+import torch.distributed as dist
+import torch.nn.functional as F
 import faiss
 import json
-from utils.PerilsEEGDataset import EEGDataset
 import time
-from torch.autograd import Variable
-from torchvision import transforms, datasets
-import torch.nn.functional as F
-import torch
-import torch.nn as nn
-import numpy as np
-from torch.utils.data import DataLoader
 
-from utils import utils
-
-device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-print(device)
-
-class NpEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        return super(NpEncoder, self).default(obj)
+class HyperParams:
+    learning_rate=0.001
+    T=0.5
+    soft_target_loss_weight=0.25
+    ce_loss_weight=0.75
+    warmup_teacher_temp = 1.7
+    teacher_temp = 0.23
+    warmup_teacher_temp_epochs = 50
 
 class Parameters:
-    ce_loss_weight = 0.50
-    soft_target_loss_weight = 0.50
-    alpha = 1
-    temperature = 2
+    ce_loss_weight = 0.95
+    mse_loss_weight = 0.20
+    soft_target_loss_weight = 0.05
+    alpha = 0.5
+    teacher_temp = 0.05
+    student_temp=0.1
+
+class CosineSimilarityLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cosine_similarity = nn.CosineSimilarity()
+
+    def forward(self, student_outputs, teacher_outputs):
+        loss = 1 - self.cosine_similarity(student_outputs, teacher_outputs).mean()
+        return loss
+
+class DINOLoss(nn.Module):
+    def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
+                 warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
+                 center_momentum=0.9):
+        super().__init__()
+        self.student_temp = student_temp
+        self.center_momentum = center_momentum
+        self.ncrops = ncrops
+        self.register_buffer("center", torch.zeros(1, out_dim))
+        # we apply a warm up for the teacher temperature because
+        # a too high temperature makes the training instable at the beginning
+        self.teacher_temp_schedule = np.concatenate((
+            np.linspace(warmup_teacher_temp,
+                        teacher_temp, warmup_teacher_temp_epochs),
+            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+        ))
+
+    def forward(self, student_output, teacher_output, epoch):
+        """
+        Cross-entropy between softmax outputs of the teacher and student networks.
+        """
+        HyperParams.T = self.teacher_temp_schedule[epoch]
+
+        student_out = student_output / self.student_temp
+        # student_out = student_out.chunk(self.ncrops)
+
+        # teacher centering and sharpening
+        temp = self.teacher_temp_schedule[epoch]
+        teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
+        # teacher_out = teacher_out.detach().chunk(2)
+
+        total_loss = 0
+        loss = torch.sum(-teacher_out * F.log_softmax(student_out, dim=-1), dim=-1)
+        total_loss += loss.mean()
+
+        # total_loss = 0
+        # n_loss_terms = 0
+        # for iq, q in enumerate(teacher_out):
+        #     for v in range(len(student_out)):
+        #         if v == iq:
+        #             # we skip cases where student and teacher operate on the same view
+        #             continue
+        #         loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+        #         total_loss += loss.mean()
+        #         n_loss_terms += 1
+        # total_loss /= n_loss_terms
+
+        self.update_center(teacher_output)
+        return total_loss
+
+    @torch.no_grad()
+    def update_center(self, teacher_output):
+        """
+        Update center used for teacher output.
+        """
+        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        dist.all_reduce(batch_center)
+        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+
+        # ema update
+        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)   
+
+class FeatureDistributionLoss(nn.Module):
+    def __init__(self, nepochs, warmup_teacher_temp, teacher_temp, warmup_teacher_temp_epochs):
+        super().__init__()
+        self.mse = nn.MSELoss()
+
+        self.teacher_temp_schedule = np.concatenate((
+            np.linspace(warmup_teacher_temp,
+                        teacher_temp, warmup_teacher_temp_epochs),
+            np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
+        ))
 
 
-def loss_fn_kd(student_logits, labels, teacher_logits, params):
-    """
-    Compute the knowledge-distillation (KD) loss given outputs, labels.
-    "Hyperparameters": temperature and alpha
+    def forward(self, student_outputs, teacher_outputs, epoch):
+        overall_loss = 0
+        # distribution loss
+        # student_mean, student_std = student_outputs.mean(), student_outputs.std()
+        # teacher_mean, teacher_std = teacher_outputs.mean(), teacher_outputs.std()
+        # mean_mse = self.mse(student_mean, teacher_mean)
+        # mean_std = self.mse(student_std, teacher_std)
 
-    NOTE: the KL Divergence for PyTorch comparing the softmaxs of teacher
-    and student expects the input tensor to be log probabilities! See Issue #2
-    """
-    alpha = params.alpha
-    T = params.temperature
-    # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1),
-    #                          F.softmax(teacher_outputs/T, dim=1)) * (alpha * T * T) + \
-    #           F.cross_entropy(outputs, labels) * (1. - alpha)
+        # mse_loss = self.mse(student_outputs, teacher_outputs)
+        # student_out = student_outputs / Parameters.student_temp
+        # teacher_out = F.softmax(teacher_outputs/Parameters.teacher_temp, dim=-1)
+        # # teacher_out = teacher_out.detach().chunk(2)
+        # total_loss = 0
+        # loss = torch.sum(-teacher_out * F.log_softmax(student_out, dim=-1), dim=-1)
+        # total_loss += loss.mean()
 
-    #Soften the student logits by applying softmax first and log() second
-    soft_targets = nn.functional.softmax(teacher_logits / T, dim=-1).to(device)
-    soft_prob = nn.functional.log_softmax(student_logits / T, dim=-1).to(device)
+        HyperParams.T = self.teacher_temp_schedule[epoch]
 
-    # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
-    soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (T**2)
+        soft_targets = nn.functional.softmax(teacher_outputs / HyperParams.T, dim=-1).to(device)
+        soft_prob = nn.functional.log_softmax(student_outputs / HyperParams.T, dim=-1).to(device)
 
-    # ce_loss = F.cross_entropy(nn.functional.softmax(student_logits, dim=-1), nn.functional.softmax(teacher_logits, dim=-1))
+        # Calculate the soft targets loss. Scaled by T**2 as suggested by the authors of the paper "Distilling the knowledge in a neural network"
+        soft_targets_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob)) / soft_prob.size()[0] * (HyperParams.T**2)
 
-    mse_loss = F.smooth_l1_loss(student_logits, teacher_logits)
-                        
-    # Weighted sum of the two losses
-    loss = params.soft_target_loss_weight * soft_targets_loss + params.ce_loss_weight * mse_loss
+        overall_loss += soft_targets_loss
 
-    # KD_loss = nn.KLDivLoss()(F.log_softmax(outputs/T, dim=1), F.softmax(teacher_outputs/T, dim=1))
+        # ce_loss = nn.functional.cross_entropy(soft_targets, soft_prob)
 
-    return loss
+        return overall_loss
 
 
-
-class FLAGS:
-    num_workers = 4
-    dist_url = "env://"
-    local_rank = 0
-    batch_size = 4
 
 def initDinoV2Model(model= "dinov2_vits14"):
     dinov2_vits14 = torch.hub.load("facebookresearch/dinov2", model)
     return dinov2_vits14
 
-# Define the LSTM model
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, n_layers=2, out_features=384):
-        super(LSTMModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.n_layer = n_layers
-        self.input_size = input_size
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=n_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, out_features)
-    
-    def forward(self, x):
-        # print(x.size())
-        batch_size, timespan, channels = x.size()
-        x = x.view(batch_size, channels, timespan)
-        lstm_init = (torch.zeros(self.n_layer, batch_size, self.hidden_size), torch.zeros(self.n_layer, batch_size, self.hidden_size))
-        if x.is_cuda: lstm_init = (lstm_init[0].cuda(), lstm_init[0].cuda())
-        lstm_init = (Variable(lstm_init[0], volatile=x.volatile), Variable(lstm_init[1], volatile=x.volatile))
-
-        # Forward LSTM and get final state
-        x = self.lstm(x, lstm_init)[0][:,-1,:]
-
-        # hx0, hx1 =  self.lstm(x, lstm_init)[1]
-        # print(hx0.size(), hx1.size())
-        # x = F.softmax(self.fc(x))
-        x = self.fc(x)
-
-        return x
-        # h0 = torch.zeros(self.n_layer, x.size(0), self.hidden_size)
-        # c0 = torch.zeros(self.n_layer, x.size(0), self.hidden_size)
-        # lstm_out, hidden_out = self.lstm(x, (h0, c0))
-        # # out = self.fc(lstm_out[:, -1, :])
-        # return lstm_out
-
-
 if __name__=="__main__":
-
 
     parser = argparse.ArgumentParser('CNN Exercise.')
     parser.add_argument('--learning_rate',
@@ -124,7 +159,7 @@ if __name__=="__main__":
                         help='Initial learning rate.')
     parser.add_argument('--num_epochs',
                         type=int,
-                        default=100,
+                        default=50,
                         help='Number of epochs to run trainer.')
     parser.add_argument('--batch_size',
                         type=int, default=16,
@@ -161,7 +196,7 @@ if __name__=="__main__":
                         help='type of mode train or test')
     parser.add_argument('--custom_model_weights',
                         type=str,
-                        default="./weights/lstm_dinov2_best_loss2.pth",
+                        default="./weights/checkpoint.pth",
                         help='custom model weights')
     parser.add_argument('--dino_base_model_weights',
                         type=str,
@@ -200,12 +235,16 @@ if __name__=="__main__":
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
 
 
+    Utilities_handler = Utilities()
+    
     FLAGS = None
     FLAGS, unparsed = parser.parse_known_args()
     print(FLAGS)
 
-    output_dir = FLAGS.log_dir + "/output" 
-    os.makedirs(FLAGS.log_dir + "/output" , exist_ok=True)
+    utils.init_distributed_mode(FLAGS)
+
+    os.makedirs(FLAGS.log_dir, exist_ok=True)
+    output_dir = FLAGS.log_dir
 
     SUBJECT = FLAGS.gallery_subject
     BATCH_SIZE = FLAGS.batch_size
@@ -213,11 +252,9 @@ if __name__=="__main__":
     EPOCHS = FLAGS.num_epochs
     SaveModelOnEveryEPOCH = 100
     EEG_DATASET_PATH = FLAGS.eeg_dataset
+    validation_frequency = 5
+    selectedDataset = f"Theperils_sub_{SUBJECT}"
     # EEG_DATASET_SPLIT = "./data/eeg/block_splits_by_image_all.pth"
-
-    LSTM_INPUT_FEATURES = 128 # should be image features output.
-    LSTM_HIDDEN_SIZE = 460  # should be same as sequence length
-    selectedDataset = "imagenet40"
 
     hyperprams = eval(FLAGS.hyperprams)
     if 'alpha' in hyperprams:
@@ -229,7 +266,7 @@ if __name__=="__main__":
     if 'temperature' in hyperprams:
         Parameters.temperature = hyperprams["temperature"]
 
-    utils.init_distributed_mode(FLAGS)
+
 
     transform_image = transforms.Compose([
         transforms.ToTensor(),
@@ -238,69 +275,86 @@ if __name__=="__main__":
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),  
     ])
 
-    dataset = EEGDataset(subset="train",
-                         eeg_signals_path=EEG_DATASET_PATH,
-                         eeg_splits_path=None, 
-                         subject=SUBJECT,
-                         time_low=0,
-                         imagesRoot=FLAGS.images_root,
-                         time_high=480,
-                         exclude_subjects=[],
-                         convert_image_to_tensor=False,
-                         apply_channel_wise_norm=False,
-                         preprocessin_fn=transform_image)
+    dataset = EEGDataset(eeg_signals_path="./data/eeg/theperils/spampinato-1-IMAGE_RAPID_RAW_with_mean_std.pth", 
+                        eeg_splits_path=None,
+                        preprocessin_fn=transform_image, 
+                        time_low=20, 
+                        time_high=480)
+    
 
 
-    eeg, label,image,i, image_features =  dataset[0]
+    
+    eeg, label,image,i, image_features = dataset[0]
+    print(eeg.shape)
+    # Utilities_handler.plotSampleEEGChannels(eeg_data=[eeg], channels_to_plot=[0])
+    # Utilities_handler.plotSampleEEGChannels(eeg_data=[eeg], channels_to_plot=[26])
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dinov2_model = initDinoV2Model(model="dinov2_vits14").to(device)
+    dinov2_model = dinov2_model.eval()
+    dinov2_model.to(device)
 
-    temporal_length,channels = eeg.size()
-    print(temporal_length,channels)
+    data_loader = DataLoader(dataset, batch_size=FLAGS.batch_size, shuffle=True)
+    # dataset.extract_features(model=dinov2_model, data_loader=data_loader, replace_eeg=False)
+    
+    eeg, label,image,i, image_features = next(iter(data_loader)) 
+    outs = dinov2_model(image.to(device))
+    features_length = outs.size(-1)
+    print(outs.size())
 
-    LSTM_INPUT_FEATURES = channels
-    LSTM_HIDDEN_SIZE = temporal_length  # should be same as sequence length
+    
+    LSTM_model = Model(input_size=96,lstm_size=100,lstm_layers=4,output_size=features_length, include_top=False)
+    LSTM_model.load_state_dict(torch.load(FLAGS.custom_model_weights)["teacher"])
+    print(f"Loaded: {FLAGS.custom_model_weights}")
+    LSTM_model.to(device)
+    LSTM_model.eval()
 
-    model = LSTMModel(input_size=LSTM_HIDDEN_SIZE,hidden_size=LSTM_INPUT_FEATURES, out_features=384, n_layers=4)
-    if os.path.exists(FLAGS.custom_model_weights):
-        model.load_state_dict(torch.load(FLAGS.custom_model_weights))
-        print(f"Loaded weights from: {FLAGS.custom_model_weights}")
-    model.to(device)
+    lstmout = LSTM_model(eeg.to(device))
+    print(lstmout.size())
 
     time_t0 = time.perf_counter()
 
-
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # dinov2_model = initDinoV2Model(model="dinov2_vits14").to(device)
-    # dinov2_model = dinov2_model.eval()
-    # dinov2_model.to(device)
-
-    data_loader_train = DataLoader(dataset, batch_size=FLAGS.batch_size, shuffle=True)
-    dataset.transformEEGDataLSTM(lstm_model=model,device=device,replaceEEG=True)
-    # dataset.extract_features(model=model, data_loader=data_loader_train, replace_eeg=False)
-
+    # dataset.transformEEGDataLSTM(lstm_model=LSTM_model,device=device,replaceEEG=True)
 
     generator1 = torch.Generator().manual_seed(43)
-    dataset, test_dataset = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=generator1)
+    ds_train, ds_test = torch.utils.data.random_split(dataset, [0.8, 0.2], generator=generator1)
 
-    dataset = dataset.dataset
-    test_dataset = test_dataset.dataset
-    
-    # data_loader_train = DataLoader(train_ds, batch_size=FLAGS.batch_size, shuffle=True)
+    data_loader_train = DataLoader(ds_train, batch_size=FLAGS.batch_size, shuffle=False)
+    data_loader_test = DataLoader(ds_test, batch_size=FLAGS.batch_size, shuffle=False)
+
+    print(f"data r:: {len(ds_train)}  test {len(ds_test)} {len(dataset)} ")
+
+    gallery_features, gallery_labels = dataset.transformEEGDataLSTMByList(model=LSTM_model,data_loader=data_loader_train)
+    query_features, query_labels = dataset.transformEEGDataLSTMByList(model=LSTM_model,data_loader=data_loader_test)
+
+    print(len(gallery_features), len(query_features))
+
+
+    # print(len(dataset.dataset.subsetData), len(test_dataset.dataset.subsetData))
+    # dataset = dataset.dataset
+    # test_dataset = test_dataset.dataset
+    # data_loader_train = DataLoader(dataset, batch_size=FLAGS.batch_size, shuffle=True)
     # data_loader_val = DataLoader(test_dataset, batch_size=FLAGS.batch_size, shuffle=True)
 
+    # gallery_features = []
+    # query_features = []
+    # # for i in range(len(dataset)):
+    # for test_eeg, test_label, test_image, test_idx, img_f in dataset:
+    #     gallery_features.append(test_eeg.cpu().numpy())
 
-    gallery_features = []
-    query_features = []
-    for i in range(len(dataset)):
-        gallery_features.append(dataset.subsetData[i]["eeg"].cpu().numpy())
-    for i in range(len(test_dataset)):
-        query_features.append(test_dataset.subsetData[i]["eeg"].cpu().numpy())
+    # # for i in range(len(test_dataset)):
+    # for test_eeg, test_label, test_image, test_idx, img_f in test_dataset:
+    #     query_features.append(test_eeg.cpu().numpy())
 
+    
     gallery_features = torch.from_numpy(np.array(gallery_features))
     query_features = torch.from_numpy(np.array(query_features))
-
     gallery_features = gallery_features.reshape(gallery_features.size(0), -1)
     query_features = query_features.reshape(query_features.size(0), -1)
+
+    # query_features = gallery_features
+    print(gallery_features.shape, query_features.shape)
+    
 
     d = gallery_features.size(-1)    # dimension
     nb = gallery_features.size(0)    # database size
@@ -328,8 +382,11 @@ if __name__=="__main__":
     for query_idx, search_res in enumerate(I):
         # print(search_res)
         labels = []
-        test_intlabel = test_dataset.labels[query_idx]
-        test_strlabel = test_dataset.class_id_to_str[test_intlabel]
+        # test_intlabel = test_dataset.dataset.labels[query_idx]
+        # test_strlabel = test_dataset.dataset.class_id_to_str[test_intlabel]
+        test_intlabel = query_labels[query_idx]["ClassId"]
+        test_strlabel = dataset.class_id_to_str[test_intlabel]
+        test_label = query_labels[query_idx]
 
         cosine_similarities = []
         cosine_similarities_labels_int = []
@@ -337,12 +394,16 @@ if __name__=="__main__":
         cosine_similarities_labels_classid = []
         cosine_similarities_images = []
 
-        test_intlabel = test_dataset.labels[query_idx]
-        test_strlabel = test_dataset.class_id_to_str[test_intlabel]
 
-        test_eeg, test_label, test_image, test_idx, img_f = test_dataset[query_idx]
+        # test_eeg, test_label, test_image, test_idx, img_f = test_dataset[query_idx]
+
+        # student_mean, student_std = test_eeg.mean(), test_eeg.std()
+        # print(img_f)
+        # teacher_mean, teacher_std = img_f.mean(), img_f.std()
+        # print(f"Student mean {student_mean} std: {student_std}  Teacher mean:{teacher_mean}  std:{teacher_std}")
         #originalImage = test_dataset.getOriginalImage(test_idx)
-        originalImage = test_dataset.getImagePath(test_idx)
+        # originalImage = test_dataset.dataset.getImagePath(test_idx)
+        originalImage = ""
 
         if test_label["ClassName"] not in class_scores["data"]:
             class_scores["data"][test_label["ClassName"]] = {"TP": 0, 
@@ -362,7 +423,8 @@ if __name__=="__main__":
                                                     }
             
         for search_res_idx in search_res:
-            intlabel = dataset.labels[search_res_idx]
+            intlabel = gallery_labels[search_res_idx]["ClassId"]
+            # intlabel = dataset.dataset.labels[search_res_idx]
             strLabel = dataset.class_id_to_str[intlabel]
             cosine_similarities_labels_str.append(strLabel)
             cosine_similarities_labels_int.append(intlabel)
@@ -386,7 +448,7 @@ if __name__=="__main__":
             class_scores["data"][test_label["ClassName"]]["classIntanceRetrival"] +=classIntanceRetrival
             class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_label["ClassId"])
         else:
-            class_scores["data"][test_label["ClassName"]]["Predicted"].append(test_dataset.class_str_to_id[cosine_similarities_labels_str[0]])
+            class_scores["data"][test_label["ClassName"]]["Predicted"].append(dataset.class_str_to_id[cosine_similarities_labels_str[0]])
 
             
         class_scores["data"][test_label["ClassName"]]["TotalRetrival"] +=TotalRetrival
@@ -454,5 +516,3 @@ if __name__=="__main__":
     csv_file.close()
     
     print(f"Completed in : {time_tn-time_t0:.2f}")
-
-    
