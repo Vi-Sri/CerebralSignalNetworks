@@ -1,4 +1,4 @@
-# Project Name
+# EEG Barlow Networks
 
 Applying Barlow twins for EEG-Image Cross modality Self supervised learning
 
